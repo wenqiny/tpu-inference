@@ -29,7 +29,8 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from tpu_inference.kernels.ragged_paged_attention.v3.util import (
-    align_to, cdiv, get_dtype_packing, get_tpu_version, next_power_of_2)
+    align_to, cdiv, get_dtype_packing, get_tpu_version,
+    is_megacore_capable_tpu, next_power_of_2)
 
 
 class RpaCase(Enum):
@@ -277,9 +278,18 @@ def get_kv_cache_shape(
 
 def _ragged_paged_attention_kernel(*args, **kwargs):
     distribution_ref = args[3]
+    num_cores = kwargs["num_cores"]
     start_seq_idx, end_seq_idx = kwargs["case"].get_range(distribution_ref)
+    # With num_cores > 1 (Megacore), each grid step (one per physical core)
+    # only owns every `num_cores`-th sequence, round-robin starting at its
+    # own core_id. This keeps the double-buffered DMA pipelining fully
+    # independent per core: no cross-core communication or ordering is
+    # needed since each core's sequences, KV pages, and output token ranges
+    # are disjoint from the other core's. With num_cores == 1, core_id is
+    # always 0 and this is identical to the original single-core loop.
+    core_id = pl.program_id(0)
 
-    @pl.loop(start_seq_idx, end_seq_idx)
+    @pl.loop(start_seq_idx + core_id, end_seq_idx, step=num_cores)
     def _(seq_idx):
         return _ragged_paged_attention_kernel_loop(
             seq_idx,
@@ -333,6 +343,7 @@ def _ragged_paged_attention_kernel_loop(
     bkv_csz,  # bkv compute size
     case: RpaCase = RpaCase.MIXED,
     debug_mode: bool = False,
+    num_cores: int = 1,
 ):
     assert q_hbm_ref.shape == o_hbm_ref.shape
     assert q_hbm_ref.shape[-1] == kv_cache_hbm_ref.shape[-1]
@@ -376,6 +387,11 @@ def _ragged_paged_attention_kernel_loop(
     bkv_p = bkv_sz // page_size
     start_seq_idx, end_seq_idx = case.get_range(distribution_ref)
     num_seqs = end_seq_idx - start_seq_idx
+    # This core's id within the grid (0 when num_cores == 1). Each core only
+    # ever sees seq_idx values of the form `start_seq_idx + core_id + k *
+    # num_cores`, so "the next sequence this core will handle" is `seq_idx +
+    # num_cores`, not `seq_idx + 1`.
+    core_id = pl.program_id(0)
 
     q_start = cu_q_lens_ref[seq_idx]
     q_end = cu_q_lens_ref[seq_idx + 1]
@@ -389,7 +405,7 @@ def _ragged_paged_attention_kernel_loop(
         # TODO(jevinjiang): can skip by page_size instead of bkv_sz.
         cur_seq_start_bkv_idx = jnp.maximum(kv_q_gap - sliding_window,
                                             0) // bkv_sz
-        next_seq_idx = jnp.minimum(seq_idx + 1, end_seq_idx - 1)
+        next_seq_idx = jnp.minimum(seq_idx + num_cores, end_seq_idx - 1)
         next_q_start = cu_q_lens_ref[next_seq_idx]
         next_q_end = cu_q_lens_ref[next_seq_idx + 1]
         next_q_len = next_q_end - next_q_start
@@ -898,7 +914,7 @@ def _ragged_paged_attention_kernel_loop(
             next_bq_idx = bq_idx + 1
             is_last_bq = next_bq_idx == num_bq
             next_bq_idx = lax.select(is_last_bq, 0, next_bq_idx)
-            next_seq_idx = lax.select(is_last_bq, seq_idx + 1, seq_idx)
+            next_seq_idx = lax.select(is_last_bq, seq_idx + num_cores, seq_idx)
             next_bq_sem_idx = lax.select(bq_sem_idx == 0, 1, 0)
             return next_seq_idx, next_bq_idx, next_bq_sem_idx
 
@@ -909,7 +925,7 @@ def _ragged_paged_attention_kernel_loop(
             next_bq_idx = lax.select(is_last_bkv, bq_idx + 1, bq_idx)
             is_last_bq = next_bq_idx == num_bq
             next_bq_idx = lax.select(is_last_bq, 0, next_bq_idx)
-            next_seq_idx = lax.select(is_last_bq, seq_idx + 1, seq_idx)
+            next_seq_idx = lax.select(is_last_bq, seq_idx + num_cores, seq_idx)
             next_bkv_sem_idx = lax.select(bkv_sem_idx == 0, 1, 0)
 
             next_bq_start_bkv_idx = 0
@@ -1093,10 +1109,12 @@ def _ragged_paged_attention_kernel_loop(
 
     ### ------- Kernel start ------- ###
 
-    @pl.when(seq_idx == start_seq_idx)
+    # This core's first sequence is `start_seq_idx + core_id`, not
+    # `start_seq_idx` (which may belong to a different core).
+    @pl.when(seq_idx == start_seq_idx + core_id)
     def prologue():
-        start_fetch_bq(seq_idx=start_seq_idx, bq_idx=0, bq_sem_idx=0)
-        start_fetch_bkv(seq_idx=start_seq_idx,
+        start_fetch_bq(seq_idx=seq_idx, bq_idx=0, bq_sem_idx=0)
+        start_fetch_bkv(seq_idx=seq_idx,
                         bkv_idx=cur_seq_start_bkv_idx,
                         bkv_sem_idx=0)
 
@@ -1104,7 +1122,10 @@ def _ragged_paged_attention_kernel_loop(
     def pipeline():
         process(static_q_len=static_q_len)
 
-    @pl.when(seq_idx == end_seq_idx - 1)
+    # This core's last sequence is the one where the next one (seq_idx +
+    # num_cores) would fall outside the case's range -- not necessarily
+    # `end_seq_idx - 1`, which may belong to a different core.
+    @pl.when(seq_idx + num_cores >= end_seq_idx)
     def epilogue():
         for i in range(2):
             wait_send_bo(bo_sem_idx=i)
@@ -1610,6 +1631,14 @@ def ragged_paged_attention(
     v_scale: float | None = None,
     # Kernel optimization params.
     chunk_prefill_size: int | None = None,
+    # If None (default), auto-detect whether to split the PREFILL case's
+    # sequences across both TensorCores of a Megacore-capable chip (today:
+    # only TPU v5p -- see `is_megacore_capable_tpu`). Pass an explicit
+    # True/False to override auto-detection (e.g. for benchmarking on real
+    # hardware). Must be a static Python bool/None, not a traced value.
+    # Only affects the PREFILL case (i.e. only takes effect when
+    # `chunk_prefill_size` is also set); DECODE and MIXED are unaffected.
+    use_megacore: bool | None = None,
     # Kernel tuning params for decode, prefill, and mixed cases.
     # Each case takes a tuple of (bq_sz, bkv_sz, bq_csz, bkv_csz).
     # - bq_sz: the block size for the query fetching.
@@ -1653,6 +1682,9 @@ def ragged_paged_attention(
     k_scale: the scale for the key.
     v_scale: the scale for the value.
     chunk_prefill_size: the chunk prefill size for the attention.
+    use_megacore: whether to split the PREFILL case's sequences across both
+      TensorCores of a Megacore-capable chip. None (default) auto-detects;
+      only takes effect when `chunk_prefill_size` is set.
     d_block_sizes: the block sizes for the decode case.
     p_block_sizes: the block sizes for the prefill case.
     m_block_sizes: the block sizes for the mixed case.
@@ -1667,6 +1699,8 @@ def ragged_paged_attention(
   """
     q, k, v = queries, keys, values
     tpu_version = get_tpu_version()
+    num_prefill_cores = (2 if (use_megacore if use_megacore is not None else
+                               is_megacore_capable_tpu()) else 1)
 
     if out_dtype is None:
         out_dtype = jnp.float32 if q.dtype == jnp.float32 else jnp.bfloat16
@@ -1744,6 +1778,7 @@ def ragged_paged_attention(
         bkv_csz,
         static_q_len=None,
         case: RpaCase = RpaCase.MIXED,
+        num_cores: int = 1,
     ):
         in_specs = [
             pl.BlockSpec(memory_space=pltpu.HBM),
@@ -1809,6 +1844,8 @@ def ragged_paged_attention(
         scope_name = f"RPA{case.symbol}-p_{page_size}-bq_{bq_sz}_{bq_csz}-bkv_{bkv_sz}_{bkv_csz}"
         if sliding_window is not None:
             scope_name += f"-sw_{sliding_window}"
+        if num_cores > 1:
+            scope_name += f"-cores{num_cores}"
         kernel = pl.pallas_call(
             functools.partial(
                 _ragged_paged_attention_kernel,
@@ -1829,18 +1866,23 @@ def ragged_paged_attention(
                 bkv_csz=bkv_csz,
                 case=case,
                 debug_mode=debug_mode,
+                num_cores=num_cores,
             ),
             grid_spec=pltpu.PrefetchScalarGridSpec(
                 num_scalar_prefetch=len(scalar_prefetches),
                 in_specs=in_specs,
                 out_specs=out_specs,
-                grid=(1, ),
+                grid=(num_cores, ),
                 scratch_shapes=scratch_shapes,
             ),
             compiler_params=pltpu.CompilerParams(
-                # TODO(jevinjiang): since each sequence depends on the previous
-                # one, we need some extra work to support Megacore mode.
-                dimension_semantics=("arbitrary", ),
+                # Sequences are independent of each other, so once we
+                # actually issue multiple grid steps (num_cores > 1), they
+                # can run in parallel across the chip's TensorCores
+                # (Megacore). With num_cores == 1 there is nothing to
+                # parallelize and this is unchanged from before.
+                dimension_semantics=("parallel", ) if num_cores > 1 else
+                ("arbitrary", ),
                 vmem_limit_bytes=vmem_limit_bytes,
                 # Paged attention invokes multiple small DMAs for each pages
                 # instead of a single large DMA. Therefore, the overhead of bounds
@@ -1918,6 +1960,7 @@ def ragged_paged_attention(
             **_prepare_block_sizes(p_block_sizes, RpaCase.PREFILL),
             static_q_len=chunk_prefill_size,
             case=RpaCase.PREFILL,
+            num_cores=num_prefill_cores,
         )
     # Mixed
     q, kv_cache = run_rpa_kernel(

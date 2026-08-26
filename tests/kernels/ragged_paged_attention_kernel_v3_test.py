@@ -24,7 +24,7 @@ from jax._src import test_util as jtu
 from tpu_inference.kernels.ragged_paged_attention.v3.kernel import (
     ragged_paged_attention, ref_ragged_paged_attention)
 from tpu_inference.kernels.ragged_paged_attention.v3.util import (
-    align_to, cdiv, get_dtype_packing)
+    align_to, cdiv, get_dtype_packing, is_megacore_capable_tpu)
 
 jax.config.parse_flags_with_absl()
 
@@ -55,6 +55,8 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
         k_scale: float | None = None,
         v_scale: float | None = None,
         use_causal_mask: bool = True,
+        chunk_prefill_size: int | None = None,
+        use_megacore: bool | None = None,
     ):
         rng = np.random.default_rng(1234)
 
@@ -149,7 +151,12 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
                             (0, max_num_seq + 1 - cu_q_lens.shape[0]))
         kv_lens = jnp.array(kv_lens, dtype=jnp.int32)
         kv_lens = jnp.pad(kv_lens, (0, max_num_seq - kv_lens.shape[0]))
-        distribution = jnp.array([0, 0, len(seq_lens)], dtype=jnp.int32)
+        if chunk_prefill_size is not None:
+            # Route every sequence through RpaCase.PREFILL instead of MIXED.
+            distribution = jnp.array(
+                [0, len(seq_lens), len(seq_lens)], dtype=jnp.int32)
+        else:
+            distribution = jnp.array([0, 0, len(seq_lens)], dtype=jnp.int32)
 
         args = (
             q,
@@ -176,10 +183,21 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
             **kwargs,
         )
 
+        if chunk_prefill_size is not None:
+            block_size_kwargs = {
+                "p_block_sizes": (bq_sz, bkv_sz, bq_csz, bkv_csz),
+                "chunk_prefill_size": chunk_prefill_size,
+                "use_megacore": use_megacore,
+            }
+        else:
+            block_size_kwargs = {
+                "m_block_sizes": (bq_sz, bkv_sz, bq_csz, bkv_csz),
+            }
+
         output, updated_kv_cache = ragged_paged_attention(
             *args,
             **kwargs,
-            m_block_sizes=(bq_sz, bkv_sz, bq_csz, bkv_csz),
+            **block_size_kwargs,
             vmem_limit_bytes=vmem_limit_bytes,
         )
         output = output[:cu_q_lens[distribution[-1]]]
@@ -358,6 +376,124 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
             dtype,
             dtype,
             num_pages,
+        )
+
+    @parameterized.product(dtype=[jnp.float32, jnp.bfloat16], )
+    def test_ragged_paged_attention_prefill_case_chunked(self, dtype):
+        # Exercises RpaCase.PREFILL (chunk_prefill_size set) at num_cores=1.
+        # This branch isn't reached by any test above (they all leave
+        # chunk_prefill_size unset, which routes everything through
+        # RpaCase.MIXED instead) and isn't reached in production today
+        # either (no caller passes chunk_prefill_size yet). This is a pure
+        # regression check that generalizing the kernel loop to use
+        # `core_id`/`num_cores` didn't change behavior when num_cores == 1;
+        # use_megacore=False pins that regardless of which TPU runs this.
+        seq_lens = [
+            (5, 18),
+            (15, 129),
+            (120, 597),
+            (100, 122),
+            (21, 64),
+            (32, 322),
+            (251, 463),
+            (40, 181),
+            (64, 1107),
+            (99, 123),
+            (10, 31),
+            (5, 18),
+            (3, 1229),
+            (120, 229),
+            (9, 87),
+            (2, 1328),
+        ]
+        num_heads = (32, 8)
+        head_dim = 128
+        page_size = 16
+        num_pages = 1000
+        max_q_len = max(q_len for q_len, _ in seq_lens)
+
+        self._test_ragged_paged_attention(
+            seq_lens,
+            num_heads,
+            head_dim,
+            page_size,
+            dtype,
+            dtype,
+            num_pages,
+            chunk_prefill_size=align_to(max_q_len, 128),
+            use_megacore=False,
+        )
+
+    def test_ragged_paged_attention_prefill_case_megacore(self):
+        # Forces num_cores=2 (grid=(2,), dimension_semantics="parallel") via
+        # the explicit use_megacore override, regardless of which TPU
+        # generation actually runs this test. Uses an odd number of
+        # sequences with widely varying q_len so round-robin assignment
+        # gives the two "cores" (grid steps) an uneven sequence count and
+        # uneven amounts of work per core -- the scenario most likely to
+        # expose an off-by-`num_cores` bug in the prologue/epilogue/
+        # next-sequence bookkeeping. Skips unless run on a Megacore-capable
+        # TPU (e.g. v5p); the user is expected to run this on real hardware.
+        if not is_megacore_capable_tpu():
+            self.skipTest("Requires a Megacore-capable TPU (e.g. v5p).")
+        seq_lens = [
+            (5, 18),
+            (251, 463),
+            (15, 129),
+            (2, 1328),
+            (120, 597),
+            (64, 1107),
+            (3, 1229),
+        ]
+        num_heads = (32, 8)
+        head_dim = 128
+        page_size = 16
+        num_pages = 1000
+        max_q_len = max(q_len for q_len, _ in seq_lens)
+
+        self._test_ragged_paged_attention(
+            seq_lens,
+            num_heads,
+            head_dim,
+            page_size,
+            jnp.bfloat16,
+            jnp.bfloat16,
+            num_pages,
+            chunk_prefill_size=align_to(max_q_len, 128),
+            use_megacore=True,
+        )
+
+    @parameterized.product(sliding_window=[5, 128], )
+    def test_ragged_paged_attention_prefill_case_megacore_sliding_window(
+            self, sliding_window: int):
+        # Sliding window is the one code path with genuinely different
+        # per-core lookahead math (the `next_seq_start_bkv_idx` peek uses
+        # `seq_idx + num_cores`, not `seq_idx + 1`) -- the part most likely
+        # to have an off-by-`num_cores` bug if something was missed.
+        if not is_megacore_capable_tpu():
+            self.skipTest("Requires a Megacore-capable TPU (e.g. v5p).")
+        num_seqs = 7
+        num_heads = (4, 4)
+        rng = np.random.default_rng(1234)
+        q_lens = rng.integers(1, 100, num_seqs)
+        kv_lens = q_lens + rng.integers(0, 50, num_seqs)
+        seq_lens = list(zip(q_lens.tolist(), kv_lens.tolist()))
+        head_dim = 128
+        page_size = 16
+        num_pages = 1000
+        max_q_len = max(q_len for q_len, _ in seq_lens)
+
+        self._test_ragged_paged_attention(
+            seq_lens,
+            num_heads,
+            head_dim,
+            page_size,
+            jnp.float32,
+            jnp.float32,
+            num_pages,
+            chunk_prefill_size=align_to(max_q_len, 128),
+            use_megacore=True,
+            sliding_window=sliding_window,
         )
 
     @parameterized.product(dtype=[jnp.float32, jnp.bfloat16], )

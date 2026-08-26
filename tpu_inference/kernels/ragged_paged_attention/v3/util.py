@@ -64,3 +64,19 @@ def get_tpu_version() -> int:
         return 8
     assert kind[:-1] == 'TPU v', kind
     return int(kind[-1])
+
+
+def is_megacore_capable_tpu() -> bool:
+    """Returns True only on TPU chips where 2 TensorCores are fused into a
+  single JAX device sharing one HBM (classic "Megacore") -- today, that's
+  only v5p among v5-v7.
+
+  This is deliberately an allow-list, not a deny-list: v5e/v6e have only 1
+  TensorCore per chip (nothing to gain from splitting a grid across cores),
+  and v7 (Ironwood) exposes its 2 TensorCores as 2 *separate* JAX devices
+  with separate HBM (2 chiplets) rather than fusing them into one device --
+  a single pallas_call's grid runs on one JAX device and cannot reach the
+  second one, so Megacore-style grid splitting does not apply there.
+  """
+    kind = jax.devices()[0].device_kind
+    return kind == 'TPU v5p'
