@@ -26,6 +26,22 @@ def _l2_normalize(x: jnp.ndarray, eps: float = 1e-6) -> jnp.ndarray:
     return (x_f32 / norm).astype(x.dtype)
 
 
+def _to_kernel_conv_state(conv_state: jnp.ndarray) -> jnp.ndarray:
+    """Inserts the unit axis `wrapper.fused_conv1d_gdn` expects.
+
+    The reference implementations below operate on the plain
+    `(num_blocks, kernel_size - 1, dim)` layout; the kernel itself expects an
+    extra unit axis matching its compact per-row VMEM layout (see
+    `kv_cache_manager.py`'s mamba cache allocation).
+    """
+    return conv_state[:, :, None, :]
+
+
+def _from_kernel_conv_state(conv_state: jnp.ndarray) -> jnp.ndarray:
+    """Inverse of `_to_kernel_conv_state`."""
+    return conv_state[:, :, 0, :]
+
+
 def gdn_attention_ref(
     qkv: jnp.ndarray,
     b: jnp.ndarray,
@@ -429,17 +445,21 @@ class GDNAttentionTest(parameterized.TestCase):
 
         # Run chunked
         new_states_chunked, output_chunked = gdn_attention_jitted(
-            **common_kwargs)
+            **{
+                **common_kwargs, "conv_state":
+                _to_kernel_conv_state(conv_state)
+            })
 
         # Compare results
         np.testing.assert_allclose(output_chunked,
                                    output_ref,
                                    rtol=2e-2,
                                    atol=2e-2)
-        np.testing.assert_allclose(new_states_chunked[0],
-                                   new_states_ref[0],
-                                   rtol=2e-2,
-                                   atol=2e-2)
+        np.testing.assert_allclose(
+            _from_kernel_conv_state(new_states_chunked[0]),
+            new_states_ref[0],
+            rtol=2e-2,
+            atol=2e-2)
         np.testing.assert_allclose(new_states_chunked[1],
                                    new_states_ref[1],
                                    rtol=2e-2,
@@ -535,7 +555,7 @@ class GDNAttentionTest(parameterized.TestCase):
             mixed_qkv,
             b,
             a,
-            conv_state,
+            _to_kernel_conv_state(conv_state),
             recurrent_state,
             conv_weight,
             conv_bias,
@@ -554,6 +574,7 @@ class GDNAttentionTest(parameterized.TestCase):
             kernel_size=kernel_size,
             num_spec_tokens=num_spec_tokens,
         )
+        new_conv = _from_kernel_conv_state(new_conv)
 
         # Reference: spec windows token-by-token with checkpoints.
         (ref_conv, ref_rec), ref_output = gdn_attention_spec_ref(
@@ -721,19 +742,21 @@ class GDNAttentionTest(parameterized.TestCase):
 
         # Reference run: fresh-zero slots.
         (new_conv_fresh, new_rec_fresh), output_fresh = run_jitted(
-            conv_state=conv_state_fresh,
+            conv_state=_to_kernel_conv_state(conv_state_fresh),
             recurrent_state=recurrent_state_fresh,
             **common_kwargs,
         )
+        new_conv_fresh = _from_kernel_conv_state(new_conv_fresh)
         # Stale-slot run: same inputs, but the slots already contain a
         # prior request's state. With the fix, has_initial_state=False
         # masks that out — outputs and the writeback at the active slots
         # must match the fresh-zero run.
         (new_conv_stale, new_rec_stale), output_stale = run_jitted(
-            conv_state=conv_state_stale,
+            conv_state=_to_kernel_conv_state(conv_state_stale),
             recurrent_state=recurrent_state_stale,
             **common_kwargs,
         )
+        new_conv_stale = _from_kernel_conv_state(new_conv_stale)
 
         np.testing.assert_allclose(output_fresh,
                                    output_stale,
@@ -826,7 +849,7 @@ class GDNAttentionTest(parameterized.TestCase):
             qkv=mixed_qkv_full,
             b=b,
             a=a,
-            conv_state=conv_state_zero,
+            conv_state=_to_kernel_conv_state(conv_state_zero),
             recurrent_state=recurrent_state_zero,
             query_start_loc=jnp.array([0, full]),
             distribution=jnp.array([0, 1, 1], dtype=jnp.int32),
@@ -839,7 +862,7 @@ class GDNAttentionTest(parameterized.TestCase):
             qkv=mixed_qkv_a,
             b=b[:half],
             a=a[:half],
-            conv_state=conv_state_zero,
+            conv_state=_to_kernel_conv_state(conv_state_zero),
             recurrent_state=recurrent_state_zero,
             query_start_loc=jnp.array([0, half]),
             distribution=jnp.array([0, 1, 1], dtype=jnp.int32),
@@ -850,6 +873,8 @@ class GDNAttentionTest(parameterized.TestCase):
         # Step B: next 32 tokens, slot now holds Step A's state.
         # seq_lens=[full] with query_lens=[half] gives context_len=half>0,
         # i.e., has_initial=True so the kernel continues from that state.
+        # `conv_after_a` is already in the kernel's native layout — no
+        # conversion needed to feed it back in.
         (_, _), output_b = run_jitted(
             qkv=mixed_qkv_b,
             b=b[half:],

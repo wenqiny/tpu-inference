@@ -107,7 +107,7 @@ def gdn_attention_core_tpu(
     conv_state, recurrent_state = vllm_context.kv_caches[layer_idx]
     state_len = conv_state.shape[1]
     if state_len > kernel_size - 1:
-        conv_state_in = conv_state[:, :kernel_size - 1, :]
+        conv_state_in = conv_state[:, :kernel_size - 1, :, :]
     else:
         conv_state_in = conv_state
 
@@ -187,7 +187,7 @@ def gdn_attention_core_tpu(
          read_state_indices=read_state_indices_sliced,
      )
     if state_len > kernel_size - 1:
-        remaining_old_state = conv_state[:, kernel_size - 1:, :]
+        remaining_old_state = conv_state[:, kernel_size - 1:, :, :]
         new_conv_state = jnp.concatenate(
             [new_conv_state_extracted, remaining_old_state], axis=1)
     else:

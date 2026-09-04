@@ -56,7 +56,10 @@ def run_jax_gdn_attention(
         j_b: Input tensor of shape `(num_tokens, n_v)`.
         j_a: Input tensor of shape `(num_tokens, n_v)`.
         conv_state: Convolutional state tensor of shape `(num_blocks, kernel_size
-          - 1, dim)`. `num_blocks` is always equal or larger than `max_seqs +
+          - 1, 1, dim)`, dtype float32. The extra unit axis and the dtype match
+          what the TPU kernel's compact per-row VMEM layout requires, so
+          neither a reshape nor a dtype cast is needed at call time.
+          `num_blocks` is always equal or larger than `max_seqs +
           1`. The first block is a null_block and only used for padded / invalid
           tokens.
         recurrent_state: Recurrent state tensor of shape `(num_blocks, n_v, d_k,
@@ -92,7 +95,7 @@ def run_jax_gdn_attention(
     Returns:
         A tuple containing:
         - A tuple of (new_conv_state, new_recurrent_state).
-          - new_conv_state: `(num_blocks, kernel_size - 1, dim)`
+          - new_conv_state: `(num_blocks, kernel_size - 1, 1, dim)`
           - new_recurrent_state: `(num_blocks, n_v, d_k, d_v)`
         - The output tensor of shape `(num_tokens, n_v * d_v)`.
     """
@@ -104,7 +107,7 @@ def run_jax_gdn_attention(
           ShardingAxisName.ATTN_HEAD),  # j_mixed_qkv
         P(ShardingAxisName.ATTN_DATA, ShardingAxisName.ATTN_HEAD),  # j_b
         P(ShardingAxisName.ATTN_DATA, ShardingAxisName.ATTN_HEAD),  # j_a
-        P(ShardingAxisName.ATTN_DATA, None,
+        P(ShardingAxisName.ATTN_DATA, None, None,
           ShardingAxisName.ATTN_HEAD),  # conv_state
         P(ShardingAxisName.ATTN_DATA, ShardingAxisName.ATTN_HEAD, None,
           None),  # recurrent_state
@@ -122,7 +125,7 @@ def run_jax_gdn_attention(
 
     out_specs = (
         (
-            P(ShardingAxisName.ATTN_DATA, None,
+            P(ShardingAxisName.ATTN_DATA, None, None,
               ShardingAxisName.ATTN_HEAD),  # new_conv_state
             P(ShardingAxisName.ATTN_DATA, ShardingAxisName.ATTN_HEAD, None,
               None),  # new_recurrent_state

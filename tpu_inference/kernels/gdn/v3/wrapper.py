@@ -275,7 +275,7 @@ def fused_conv1d_gdn(
     qkv: jax.Array,  # [batch_size, n_kq * d_k * 2 + n_v * d_v = dim_size]
     b: jax.Array,  # [batch_size, n_v]
     a: jax.Array,  # [batch_size, n_v]
-    conv_state: jax.Array,  # [num_seqs + 1, kernel_size - 1, dim_size]
+    conv_state: jax.Array,  # [num_seqs + 1, kernel_size - 1, 1, dim_size], fp32
     recurrent_state: jax.Array,  # [num_seqs + 1, nv, dk, dv]
     conv_weight: jax.Array,  # [kernel_size - 1, dim_size]
     conv_bias: jax.Array | None,  # [dim_size]
@@ -308,10 +308,14 @@ def fused_conv1d_gdn(
         b: b tensor (for beta) of shape [batch_size, n_v].
         a: a tensor (for g) of shape [batch_size, n_v].
         conv_state: Convolution state cache tensor of shape [num_seqs + 1,
-            kernel_size - 1, dim_size] containing the last (kernel_size - 1) tokens
-            from the last sequence invocation. The first slot is a null block used for
-            padded or invalid tokens. It may contain garbage data if it is a first
-            invocation of a sequence.
+            kernel_size - 1, 1, dim_size], dtype float32. The unit axis matches
+            the kernel's compact per-row VMEM layout and the dtype matches what
+            that layout requires, so neither a reshape nor a dtype cast is
+            needed here — the cache must already be allocated this way (see
+            `kv_cache_manager.py`'s `_mamba_state_dtype`). Contains the last
+            (kernel_size - 1) tokens from the last sequence invocation. The
+            first slot is a null block used for padded or invalid tokens. It
+            may contain garbage data if it is a first invocation of a sequence.
         recurrent_state: Recurrent state cache tensor of shape [num_seqs + 1, n_v,
             d_k, d_v]. The first slot is a null block used for padded or invalid
             tokens. It may contain garbage data if it is a first invocation of a
@@ -366,11 +370,16 @@ def fused_conv1d_gdn(
     qkv = qkv.astype(jnp.float32)
     b = b.astype(jnp.float32)
     a = a.astype(jnp.float32)
-    conv_state = conv_state.astype(jnp.float32)
 
     # Step 1: Validate inputs.
     num_seqs = state_indices.size
     batch_size, dim = qkv.shape
+    # conv_state must already be fp32 — the GDN/conv1d TPU kernels' compact
+    # per-row VMEM layout only supports 32-bit dtypes (see
+    # vmem_ldst.load_compact_to_large's itemsize assertion), so the cache is
+    # allocated as fp32 from the start (kv_cache_manager.py's
+    # `_mamba_state_dtype`) rather than upcast here on every call.
+    assert conv_state.dtype == jnp.float32
     assert conv_weight.shape == (dim, 1, kernel_size)
     if conv_bias is not None:
         assert conv_bias.shape == (dim, )
@@ -428,11 +437,9 @@ def fused_conv1d_gdn(
     b = b.reshape(padded_batch_size, 1, -1)
     a = a.reshape(padded_batch_size, 1, -1)
 
-    # Step 3: States and weights pre-processing.
+    # Step 3: Weights pre-processing.
     # TODO(kyuyeunk): To eliminate runtime cost, move this logic into model
     # loading stage.
-    conv_state_shape = conv_state.shape
-    conv_state = conv_state.reshape(-1, kernel_size - 1, 1, dim)
     conv_weight = conv_weight.swapaxes(0, 2).astype(jnp.float32)
     conv_bias = conv_bias.astype(
         jnp.float32) if conv_bias is not None else None
@@ -565,7 +572,6 @@ def fused_conv1d_gdn(
 
     out_act = out_act.reshape(padded_batch_size, -1)[:batch_size]
     out_conv_state = out_conv_state.astype(conv_out_dtype)
-    out_conv_state = out_conv_state.reshape(conv_state_shape)
     out_recurrent_state = out_recurrent_state.astype(recurrent_out_dtype)
 
     return (out_conv_state, out_recurrent_state), out_act

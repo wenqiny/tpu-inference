@@ -11,13 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import dataclasses
 import os
 from typing import TYPE_CHECKING, List
 
 import jax
 import jax.numpy as jnp
 import vllm.envs as envs
+from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import NamedSharding, PartitionSpec
 from torchax.ops.mappings import t2j_dtype
 from vllm.config import get_layers_from_vllm_config, set_current_vllm_config
@@ -70,6 +70,99 @@ def is_cache_for_ds_v4(attn_module: AttentionLayerBase) -> bool:
 
 def is_ds_v4(vllm_config):
     return "DeepseekV4ForCausalLM" in (vllm_config.model_config.architectures)
+
+
+def _mamba_state_dtype(state_index: int, declared_dtype) -> jnp.dtype:
+    """Dtype actually allocated for a mamba cache state — overrides vLLM's
+    declared `MambaSpec.dtypes[state_index]` for conv_state.
+
+    conv_state (state_index 0) is forced to fp32 regardless of what vLLM
+    declares (normally bf16). The GDN/conv1d TPU kernels' compact per-row
+    VMEM layout only works for 32-bit dtypes (see
+    `vmem_ldst.load_compact_to_large`'s `assert vmem_ref.dtype.itemsize ==
+    4`, and `wrapper.fused_conv1d_gdn`'s unconditional
+    `conv_state.astype(jnp.float32)`), so a bf16-stored conv_state needs an
+    eager whole-cache upcast-and-relayout before every kernel call; storing
+    it as fp32 from the start makes that cast a genuine no-op instead
+    (same dtype in, same dtype out — XLA elides it). Unlike the SSM
+    recurrent state (state_index 1, `mamba_ssm_dtype` in the HF config),
+    conv1d's short, fixed-window sum has no numerical-stability reason to
+    need fp32 — this is purely working around the TPU-layout constraint,
+    at the cost of ~2x the HBM for this (small) cache.
+
+    `_mamba_slot_bytes` and `initialize_kv_cache`'s Pass 2 must both derive
+    the allocated dtype from here so they can't drift apart.
+    """
+    if state_index == 0:
+        return jnp.float32
+    return t2j_dtype(declared_dtype)
+
+
+def _mamba_slot_bytes(spec: MambaSpec) -> int:
+    """Real per-slot byte footprint for `spec.shapes`/`spec.dtypes`,
+    accounting for TPU (sublane, lane) tile padding.
+
+    `MambaSpec.page_size_bytes` (vLLM's own accounting) is just
+    `prod(shape) * dtype_size` on the declared, dense shape — it has no idea
+    about the physical layout and dtype the TPU allocation actually uses.
+    In particular, the conv_state slot (state_index 0) is physically
+    allocated as fp32 (see `_mamba_state_dtype`) with an extra unit axis —
+    `(conv_kernel_size, 1, intermediate_size)` instead of the declared
+    `(conv_kernel_size, intermediate_size)` — to match the GDN/conv1d TPU
+    kernels' compact per-row VMEM layout (see the `state_index == 0` branch
+    in `initialize_kv_cache`'s Pass 2 below), and XLA pads that layout's
+    minor two dims out to the TPU's native (sublane, lane) tile. Using
+    vLLM's nominal byte count here would under-count what actually gets
+    allocated and let the compact-mamba budget math in
+    `_maybe_set_compact_mamba_num_blocks_override` hand out more attention
+    blocks than actually fit — a real HBM overcommit risk, not just an
+    efficiency one.
+
+    Must be kept in sync with the `cache_shape`/dtype construction in
+    Pass 2 — if either changes, this needs to change with it.
+
+    `pltpu.get_tpu_info()` needs a real TPU backend; on CPU-only test/CI
+    runs (no TPU device) it raises, so this falls back to a dense,
+    unpadded estimate (still using the real fp32 conv_state dtype, just
+    without the tile-padding factor) rather than propagating the error —
+    matching `tpu_info.get_tpu_vmem_size_bytes`'s fallback convention.
+    """
+    try:
+        tpu_info = pltpu.get_tpu_info()
+        num_lanes = tpu_info.num_lanes
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "Failed to query TPU tiling info for mamba byte accounting "
+            "(%s); falling back to a dense (unpadded) estimate.", exc)
+        tpu_info = None
+        num_lanes = None
+
+    total_bytes = 0
+    for state_index, (shape, dtype) in enumerate(zip(spec.shapes,
+                                                      spec.dtypes)):
+        jax_dtype = _mamba_state_dtype(state_index, dtype)
+        if state_index == 0:
+            # conv_state: declared (conv_kernel_size, intermediate_size) ->
+            # physically allocated (conv_kernel_size, 1, intermediate_size).
+            padded_shape = (shape[0], 1, shape[1])
+        else:
+            padded_shape = tuple(shape)
+        if tpu_info is None:
+            num_elems = 1
+            for d in padded_shape:
+                num_elems *= d
+        else:
+            leading, second_minor, minor = (padded_shape[:-2],
+                                            padded_shape[-2],
+                                            padded_shape[-1])
+            sublane = tpu_info.get_sublane_tiling(jax_dtype)
+            tiled_second_minor = -(-second_minor // sublane) * sublane
+            tiled_minor = -(-minor // num_lanes) * num_lanes
+            num_elems = tiled_second_minor * tiled_minor
+            for d in leading:
+                num_elems *= d
+        total_bytes += num_elems * jnp.dtype(jax_dtype).itemsize
+    return total_bytes
 
 
 class KVCacheManager:
@@ -173,10 +266,12 @@ class KVCacheManager:
         num_mamba_groups × mamba_unpadded`, where `attn_page` is the
         TPU-actual per-block bytes (from `get_attention_page_size_bytes`,
         which accounts for dtype packing like fp8) and `mamba_unpadded` is
-        the natural `prod(shape) × dtype_size`. vLLM then computes a
-        smaller `num_blocks` that exactly matches what we allocate per layer
-        on the TPU side. HBM usage is unchanged; only the block-ID
-        accounting lines up.
+        the real, TPU-tile-padded per-slot bytes (see `_mamba_slot_bytes` —
+        *not* the naive `prod(shape) × dtype_size` on vLLM's declared shape,
+        which undercounts the compact-layout conv_state slot). vLLM then
+        computes a smaller `num_blocks` that exactly matches what we
+        allocate per layer on the TPU side. HBM usage is unchanged; only the
+        block-ID accounting lines up.
 
         Args:
             layers: A dictionary mapping layer names to their corresponding
@@ -220,13 +315,13 @@ class KVCacheManager:
                 attn_page_size_bytes)
             return
 
-        # Compute the unpadded mamba page size from an actual mamba module's
-        # spec (shapes × dtype-size), ignoring any existing padding.
+        # Compute the *actual* per-layer mamba page size — the physical,
+        # tile-padded byte count we allocate (see `_mamba_slot_bytes`), not
+        # vLLM's nominal `prod(shape) * dtype_size` on the declared shape.
         first_mamba_spec = mamba_modules[0].get_kv_cache_spec(
             self.runner.vllm_config)
         assert isinstance(first_mamba_spec, MambaSpec)
-        unpadded_mamba_page_size = dataclasses.replace(
-            first_mamba_spec, page_size_padded=None).page_size_bytes
+        unpadded_mamba_page_size = _mamba_slot_bytes(first_mamba_spec)
 
         # Derive vLLM's kv-cache group layout. vLLM splits each type into
         # equal-sized groups of `group_size` layers, then allocates
@@ -328,8 +423,8 @@ class KVCacheManager:
         Args:
             attn_page_size_bytes: TPU-actual bytes per block per attention
                 layer (accounts for dtype packing like fp8).
-            unpadded_mamba_page_size_bytes: bytes per slot per mamba layer
-                (`prod(shape) × dtype_size`, no padding).
+            unpadded_mamba_page_size_bytes: real, TPU-tile-padded bytes per
+                slot per mamba layer (see `_mamba_slot_bytes`).
             num_attn_groups: # vLLM kv-cache groups holding attention layers.
             num_mamba_groups: # vLLM kv-cache groups holding mamba layers.
             num_attn_layers: total attention layers (logging only).
@@ -827,8 +922,11 @@ class KVCacheManager:
                     for name in kv_cache_tensor.layers:
                         spec = layer_name_to_spec[name]
                         if isinstance(spec, MambaSpec):
-                            total_group_page_size += dataclasses.replace(
-                                spec, page_size_padded=None).page_size_bytes
+                            # Real, tile-padded bytes (see `_mamba_slot_bytes`
+                            # docstring) — not vLLM's nominal page_size_bytes,
+                            # which would undercount and let this compute
+                            # more tensor_num_blocks than actually fit.
+                            total_group_page_size += _mamba_slot_bytes(spec)
                         else:
                             total_group_page_size += get_attention_page_size_bytes(
                                 self.runner.mesh, spec.block_size,
@@ -941,18 +1039,29 @@ class KVCacheManager:
                 mamba_states = []
                 for state_index, (shape, dtype) in enumerate(
                         zip(layer_spec.shapes, layer_spec.dtypes)):
-                    jax_dtype = t2j_dtype(dtype)
-                    cache_shape = (num_blocks, *shape)
+                    jax_dtype = _mamba_state_dtype(state_index, dtype)
                     if state_index == 0:
-                        # conv_state: [num_blocks, conv_kernel_size, intermediate_size]
-                        spec = PartitionSpec(ShardingAxisName.ATTN_DATA, None,
+                        # conv_state: physically allocated as fp32 (see
+                        # `_mamba_state_dtype`) [num_blocks,
+                        # conv_kernel_size, 1, intermediate_size] (an extra
+                        # unit axis vs. vLLM's declared [conv_kernel_size,
+                        # intermediate_size] shape) so it already matches
+                        # the GDN/conv1d TPU kernels' compact per-row VMEM
+                        # layout — no reshape or dtype cast needed at
+                        # kernel-call time (`_mamba_slot_bytes` accounts
+                        # for the real, larger footprint this costs).
+                        cache_shape = (num_blocks, shape[0], 1, shape[1])
+                        spec = PartitionSpec(ShardingAxisName.ATTN_DATA,
+                                             None, None,
                                              ShardingAxisName.ATTN_HEAD)
                     elif state_index == 1:
+                        cache_shape = (num_blocks, *shape)
                         # ssm_state: [num_blocks, num_heads, head_dim, state_size]
                         spec = PartitionSpec(ShardingAxisName.ATTN_DATA,
                                              ShardingAxisName.ATTN_HEAD, None,
                                              None)
                     else:
+                        cache_shape = (num_blocks, *shape)
                         spec = PartitionSpec(
                             None, *([None] * (len(cache_shape) - 1)))
 
